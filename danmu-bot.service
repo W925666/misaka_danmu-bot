@@ -1,0 +1,39 @@
+[Unit]
+Description=Danmu Server Integration Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 /root/danmu_bot.py
+
+# --- 【核心修改】 ---
+# 将 Restart策略 从 on-failure 改为 always
+# 这样无论是正常退出(如/reboot命令)还是异常退出，systemd都会重启它
+Restart=always
+
+# 增加一个重启延迟，这是一个好习惯，可以防止快速失败循环
+RestartSec=3
+# --- 修改结束 ---
+
+# --- 配置环境变量 ---
+
+# 机器人自身的配置
+Environment="LOG_LEVEL=INFO"
+Environment="TELEGRAM_BOT_TOKEN=你的机器人token"
+Environment="ADMIN_ID=tg管理员id"
+
+# 弹幕服务器的配置
+Environment="DANMU_SERVER_URL=http://localhost:7768"
+Environment="DANMU_SERVER_API_KEY=御坂api"
+
+# --- 用于API Key自动重置的配置 ---
+Environment="DANMU_SERVER_ADMIN_USER=御坂账号"
+Environment="DANMU_SERVER_ADMIN_PASSWORD=御坂密码"
+
+# 如果您申请了TMDB API Key，在这里加上下面这行
+Environment="TMDB_API_KEY=api"
+
+[Install]
+WantedBy=multi-user.target
