@@ -2,8 +2,8 @@
 
 """
 一个功能完整、经过重构和优化的Telegram弹幕机器人脚本。
-
 """
+
 import asyncio
 import json
 import logging
@@ -588,48 +588,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = await update.message.reply_text(help_text, parse_mode="Markdown")
     schedule_message_deletion(context, reply)
 
-# 新增一个统一的防重复检查函数
-async def _check_for_duplicate(context: ContextTypes.DEFAULT_TYPE, search_results: List[Dict], status_msg: Message) -> bool:
-    """
-    检查搜索结果是否已存在于弹幕库，基于多个字段进行匹配。
-    如果发现重复，则返回 True 并发送提示消息；否则返回 False。
-    """
-    if not search_results:
-        return False
-        
-    try:
-        library_items = await api_call(context, "GET", "/api/control/library")
-        # 创建一个已存在的作品元数据集合，用于高效查找。
-        library_metadata_set = set()
-        for item in library_items:
-            title = item.get("title", "").strip().lower()
-            year = item.get("year", None)
-            season = item.get("season", None)
-            episode_count = item.get("episodeCount", None)
-            library_metadata_set.add((title, year, season, episode_count))
-
-        for result in search_results:
-            # 提取搜索结果的元数据
-            result_title = result.get("title", "").strip().lower()
-            result_year = result.get("year", None)
-            result_season = result.get("season", None)
-            result_episode_count = result.get("episodeCount", None)
-            
-            # 构建待匹配的元数据元组
-            result_metadata_tuple = (result_title, result_year, result_season, result_episode_count)
-            
-            if result_metadata_tuple in library_metadata_set:
-                await status_msg.edit_text(f"ℹ️ 检测到 `{result.get('title')}` 已存在于您的弹幕库中，无需重复导入。")
-                schedule_message_deletion(context, status_msg)
-                return True
-    except ValueError as e:
-        logger.error(f"在防重复检查中获取弹幕库失败: {e}")
-        await status_msg.edit_text(f"❌ 智能分析失败: {e}", parse_mode="Markdown")
-        return True # 发生错误时，为了安全起见，阻止继续导入
-
-    return False
-
-
 @check_and_update_limit
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_callback = update.callback_query is not None
@@ -651,10 +609,9 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError as e:
             await status_msg.edit_text(f"❌ 搜索失败: {e}"); return
         
-        # 【修复】在search命令中也执行防重复检查
-        if await _check_for_duplicate(context, search_results, status_msg):
-            return
-
+        if not search_results:
+            await status_msg.edit_text("未找到任何匹配结果。"); return
+            
         context.user_data['last_search_results'] = search_results
         context.user_data['search_start_index'] = 0
         message_to_edit = status_msg
@@ -662,9 +619,6 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_to_edit = update.callback_query.message
 
     search_results = context.user_data.get('last_search_results', [])
-    if not search_results:
-        await message_to_edit.edit_text("未找到任何匹配结果。"); return
-    
     start_index = context.user_data.get('search_start_index', 0)
     page_size = config.search_page_size
     current_page_results = search_results[start_index : start_index + page_size]
@@ -679,6 +633,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if season: extra_details.append(f"季:{season}")
             if episode_count: extra_details.append(f"总集:{episode_count}")
             if extra_details: button_text += f" - {' | '.join(extra_details)}"
+        # 【修复】此处不进行重复检查，直接生成回调按钮
         callback_data = json.dumps({"action": CallbackAction.IMPORT_ITEM.value, "idx": index_in_full_list})
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
     pagination_buttons = []
@@ -746,8 +701,9 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         search_results = (await api_call(context, "GET", "/api/control/search", params={"keyword": final_term})).get('results', [])
 
-        # 在import命令中也执行防重复检查
-        if await _check_for_duplicate(context, search_results, status_msg):
+        if not search_results:
+            await status_msg.edit_text(f"❌ 找不到与 `{final_term}` 匹配的作品。")
+            schedule_message_deletion(context, status_msg)
             return
 
         context.user_data['last_search_results'] = search_results
@@ -772,6 +728,7 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if episode_count: extra_details.append(f"总集:{episode_count}")
                 if extra_details: button_text += f" - {' | '.join(extra_details)}"
             
+            # 【修复】此处不进行重复检查，直接生成回调按钮
             callback_data = json.dumps({"action": CallbackAction.IMPORT_ITEM.value, "idx": index_in_full_list})
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
 
@@ -931,11 +888,43 @@ async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == CallbackAction.LIBRARY_PAGE_PREV or action == CallbackAction.LIBRARY_PAGE_NEXT:
         page = data.get("p", 1)
         await _display_library(update, context, page=page)
+    # 【修复】在这里进行重复导入检查
     elif action == CallbackAction.IMPORT_ITEM:
         result_index = data["idx"]
         selected = context.user_data.get('last_search_results', [])[result_index]
-        await query.message.edit_text(f"⏳ 正在导入 `{selected.get('title')}`...", reply_markup=None)
-        await _execute_auto_import(query.message, context, selected.get("title"), selected.get("type"), selected.get("season"))
+        
+        # 实时获取最新弹幕库列表进行检查
+        status_msg = query.message
+        try:
+            library_items = await api_call(context, "GET", "/api/control/library")
+            library_metadata_set = set()
+            for item in library_items:
+                title = item.get("title", "").strip().lower()
+                year = item.get("year", None)
+                season = item.get("season", None)
+                episode_count = item.get("episodeCount", None)
+                library_metadata_set.add((title, year, season, episode_count))
+            
+            result_title = selected.get("title", "").strip().lower()
+            result_year = selected.get("year", None)
+            result_season = selected.get("season", None)
+            result_episode_count = selected.get("episodeCount", None)
+            result_metadata_tuple = (result_title, result_year, result_season, result_episode_count)
+
+            if result_metadata_tuple in library_metadata_set:
+                await status_msg.edit_text(f"ℹ️ 检测到 `{selected.get('title')}` 已存在于您的弹幕库中，无需重复导入。")
+                schedule_message_deletion(context, status_msg)
+                return
+        except ValueError as e:
+            logger.error(f"在回调处理中获取弹幕库失败: {e}")
+            await status_msg.edit_text(f"❌ 智能分析失败: {e}", parse_mode="Markdown")
+            return
+
+        # 如果通过检查，则继续导入
+        media_type = selected.get("type")
+        await status_msg.edit_text(f"⏳ 正在导入 `{selected.get('title')}`...", reply_markup=None)
+        await _execute_auto_import(status_msg, context, selected.get("title"), selected.get("type"), selected.get("season"))
+
     elif action == CallbackAction.CONFIRM_IMPORT_MOVIE:
         term = context.user_data.get('import_term')
         if not term: await query.message.edit_text("❌ 操作已过期或失败，请重新发起导入。"); return
@@ -985,7 +974,7 @@ async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _display_tasks_list(update, context, page=1)
     elif action in [CallbackAction.PAUSE_TASK, CallbackAction.RESUME_TASK, CallbackAction.ABORT_TASK, CallbackAction.DELETE_TASK] and user_id in config.admin_ids:
         task_index = data["idx"]; task_id = context.user_data.get('displayed_tasks', [])[task_index].get("taskId")
-        action_map = {CallbackAction.PAUSE_TASK: ("POST", f"/api/control/tasks/{task_id}/pause", "暂停"), CallbackAction.RESUME_TASK: ("POST", f"/api/control/tasks/{task_id}/resume", "恢复"), CallbackAction.ABORT_TASK: ("POST", f"/api/control/tasks/{task_id}/abort", "中止"), CallbackAction.DELETE_TASK: ("DELETE", f"/api/control/tasks/{task_id}", "删除")}
+        action_map = {CallbackAction.PAUSE_TASK: ("POST", f"/api/control/tasks/{task_id}/pause", "暂停"), CallbackCallbackAction.RESUME_TASK: ("POST", f"/api/control/tasks/{task_id}/resume", "恢复"), CallbackAction.ABORT_TASK: ("POST", f"/api/control/tasks/{task_id}/abort", "中止"), CallbackAction.DELETE_TASK: ("DELETE", f"/api/control/tasks/{task_id}", "删除")}
         method, endpoint, msg = action_map[action]
         try: await api_call(context, method, endpoint); await query.answer(f"✅ 已发送“{msg}”指令。")
         except ValueError as e: await query.answer(f"❌ 操作失败: {e}", show_alert=True)
