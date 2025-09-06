@@ -60,7 +60,7 @@ class AppConfig:
         # 根据是否配置了管理员用户名和密码，自动判断是否启用API密钥自动重置功能。
         self.auto_reset_api_key_enabled: bool = bool(self.danmu_server_admin_user and self.danmu_server_admin_password)
         # 用户每日操作的限制次数，默认值为10次。
-        self.user_daily_limit: int = int(os.getenv("USER_DAILY_LIMIT", "10"))
+        self.user_daily_limit: int = int(os.getenv("USER_DAILY_LIMIT", "100"))
 
         # --- 全局常量配置 ---
         # 搜索结果每页显示的项目数量，默认值为5。
