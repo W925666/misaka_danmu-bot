@@ -59,7 +59,7 @@ class AppConfig:
         self.enable_hot_reload: bool = os.getenv('ENABLE_HOT_RELOAD', 'false').lower() == 'true'
         # 根据是否配置了管理员用户名和密码，自动判断是否启用API密钥自动重置功能。
         self.auto_reset_api_key_enabled: bool = bool(self.danmu_server_admin_user and self.danmu_server_admin_password)
-        # 用户每日操作的限制次数，默认值为10次。
+        # 用户每日操作的限制次数，默认值为100次。
         self.user_daily_limit: int = int(os.getenv("USER_DAILY_LIMIT", "100"))
 
         # --- 全局常量配置 ---
@@ -605,12 +605,57 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             search_data = await api_call(context, "GET", "/api/control/search", params={"keyword": query_text})
-            search_results = search_data.get('results', [])
+            raw_results = search_data.get('results', [])
         except ValueError as e:
             await status_msg.edit_text(f"❌ 搜索失败: {e}"); return
         
-        if not search_results:
+        if not raw_results:
             await status_msg.edit_text("未找到任何匹配结果。"); return
+        
+        # 【新增】去重和排序逻辑
+        deduplicated_results = []
+        seen_keys = set()
+        for item in raw_results:
+            key = (item.get('title'), item.get('year'), item.get('season'))
+            
+            # 如果是电视剧，且有总集数，则优先保留这个版本
+            if item.get('type') == 'tv_series' and item.get('episodeCount') is not None:
+                if key in seen_keys:
+                    for i, existing_item in enumerate(deduplicated_results):
+                        if (existing_item.get('title'), existing_item.get('year'), existing_item.get('season')) == key:
+                            deduplicated_results[i] = item
+                            break
+                else:
+                    deduplicated_results.append(item)
+                    seen_keys.add(key)
+            # 如果是其他条目，或没有总集数的电视剧，直接添加（去重）
+            elif key not in seen_keys:
+                deduplicated_results.append(item)
+                seen_keys.add(key)
+        
+        # 排序逻辑：
+        # 1. 电影 (`type == 'movie'`)
+        # 2. 有总集数的电视剧 (`type == 'tv_series'` and `episodeCount is not None`)，按季数降序
+        # 3. 没有总集数的电视剧 (`type == 'tv_series'` and `episodeCount is None`)，按季数降序
+        def custom_sort_key(item):
+            item_type = item.get('type')
+            episode_count = item.get('episodeCount')
+            season_number = int(item.get('season') or 0)
+            
+            if item_type == 'movie':
+                # 电影优先级最高
+                return (0,)
+            elif item_type == 'tv_series' and episode_count is not None:
+                # 有总集数的电视剧次之，按季数降序
+                return (1, -season_number)
+            elif item_type == 'tv_series' and episode_count is None:
+                # 没有总集数的电视剧再次，按季数降序
+                return (2, -season_number)
+            else:
+                # 其他所有条目最后
+                return (3,)
+
+        search_results = sorted(deduplicated_results, key=custom_sort_key)
             
         context.user_data['last_search_results'] = search_results
         context.user_data['search_start_index'] = 0
@@ -625,15 +670,20 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for i, result in enumerate(current_page_results):
         index_in_full_list = start_index + i
-        title, year = result.get("title", "无标题"), result.get("year", "未知"); icon = "📺" if result.get("type") == "tv_series" else "🎬"
+        title, year = result.get("title", "无标题"), result.get("year", "未知")
+        
+        # 修复图标逻辑：根据'type'字段判断
+        icon = "📺" if result.get("type") == "tv_series" else "🎬"
+
         button_text = f"{icon} {title} ({year})"
+        
         if result.get("type") == "tv_series":
             extra_details = []
             season = result.get("season"); episode_count = result.get("episodeCount")
             if season: extra_details.append(f"季:{season}")
             if episode_count: extra_details.append(f"总集:{episode_count}")
             if extra_details: button_text += f" - {' | '.join(extra_details)}"
-        # 【修复】此处不进行重复检查，直接生成回调按钮
+        
         callback_data = json.dumps({"action": CallbackAction.IMPORT_ITEM.value, "idx": index_in_full_list})
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
     pagination_buttons = []
@@ -699,15 +749,50 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_admin_notification(context, update.message.from_user, "搜索/导入", final_term)
     
     try:
-        search_results = (await api_call(context, "GET", "/api/control/search", params={"keyword": final_term})).get('results', [])
+        search_data = await api_call(context, "GET", "/api/control/search", params={"keyword": final_term})
+        raw_results = search_data.get('results', [])
 
-        if not search_results:
+        if not raw_results:
             await status_msg.edit_text(f"❌ 找不到与 `{final_term}` 匹配的作品。")
             schedule_message_deletion(context, status_msg)
             return
+        
+        # 【新增】去重和排序逻辑
+        deduplicated_results = []
+        seen_keys = set()
+        for item in raw_results:
+            key = (item.get('title'), item.get('year'), item.get('season'))
+            
+            if item.get('type') == 'tv_series' and item.get('episodeCount') is not None:
+                if key in seen_keys:
+                    for i, existing_item in enumerate(deduplicated_results):
+                        if (existing_item.get('title'), existing_item.get('year'), existing_item.get('season')) == key:
+                            deduplicated_results[i] = item
+                            break
+                else:
+                    deduplicated_results.append(item)
+                    seen_keys.add(key)
+            elif key not in seen_keys:
+                deduplicated_results.append(item)
+                seen_keys.add(key)
+
+        def custom_sort_key(item):
+            item_type = item.get('type')
+            episode_count = item.get('episodeCount')
+            season_number = int(item.get('season') or 0)
+            
+            if item_type == 'movie':
+                return (0,)
+            elif item_type == 'tv_series' and episode_count is not None:
+                return (1, -season_number)
+            elif item_type == 'tv_series' and episode_count is None:
+                return (2, -season_number)
+            else:
+                return (3,)
+
+        search_results = sorted(deduplicated_results, key=custom_sort_key)
 
         context.user_data['last_search_results'] = search_results
-        context.user_data['search_start_index'] = 0
         
         start_index = 0
         page_size = config.search_page_size
@@ -717,18 +802,18 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, result in enumerate(current_page_results):
             index_in_full_list = start_index + i
             title, year = result.get("title", "无标题"), result.get("year", "未知")
+            
             icon = "📺" if result.get("type") == "tv_series" else "🎬"
+
             button_text = f"{icon} {title} ({year})"
             
             if result.get("type") == "tv_series":
                 extra_details = []
-                season_val = result.get("season")
-                episode_count = result.get("episodeCount")
-                if season_val: extra_details.append(f"季:{season_val}")
+                season = result.get("season"); episode_count = result.get("episodeCount")
+                if season: extra_details.append(f"季:{season}")
                 if episode_count: extra_details.append(f"总集:{episode_count}")
                 if extra_details: button_text += f" - {' | '.join(extra_details)}"
             
-            # 【修复】此处不进行重复检查，直接生成回调按钮
             callback_data = json.dumps({"action": CallbackAction.IMPORT_ITEM.value, "idx": index_in_full_list})
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
 
