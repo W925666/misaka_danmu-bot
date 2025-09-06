@@ -2,38 +2,8 @@
 
 """
 一个功能完整、经过重构和优化的Telegram弹幕机器人脚本。
-最终版本：
-- 修复了systemd下的启动和关停问题。
-- 重构了电视剧导入流程，采用批量导入模式。
-- 优化了UI和命令提示，确保示例命令可被复制。
-- 【新】增加了API Key自动重置功能，在遭遇持续API速率限制或授权失败时能自动登录并更换Key。
-- 【修复】补全了缺失的 start_command 和 help_command 函数定义。
-- 【修复】根据F12抓包和日志，修正认证流程为 Bearer Token 模式并校准了Token字段名。
-- 【优化】合并了/search和/import命令在无参数时的两条回复为一条。
-- 【修复】解决了当列表内容无变化时，点击刷新按钮报错的问题。
-- 【修复】修复了直接调用/tasks和/library命令时，因编辑错误消息而报错的问题。
-- 【新功能】import_command 已升级，现在可以识别视频页面URL并自动抓取标题进行导入。
-- 【功能增强】大幅优化了URL标题清洗逻辑，能更准确地提取媒体名称，提高匹配成功率。
-- 【修复-20250905】修正了_get_title_from_url函数中的正则表达式错误，解决了URL解析失败的问题。
-- 【修复-20250905】修复了`import`命令在处理多类型结果时因callback_data超长而崩溃的问题，并补全了缺失的回调处理逻辑。
-- 【功能调整-20250905】调整了消息删除机制：仅在群聊中自动删除消息，私聊中保留。
-- 【功能增强-20250905】重写了 `import` 命令的季数解析逻辑，支持1-99的中文数字季数（如“第三十三季”），大幅提升电视剧导入的识别准确率。
-- 【逻辑修复-20250905】修正了从URL解析出季数时，会跳过手动选择而直接自动导入的逻辑问题。
-- 【逻辑修复-20250905】增强了`api_call`函数的健壮性，能正确处理API返回空响应体的情况，防止JSON解析错误。
-- 【逻辑重构-20250905】重构了`/import`命令，使其在任何情况下都展示搜索结果列表让用户手动选择，避免意外的自动导入。
-- 【功能增强-20250905】搜索结果列表（/search 和 /import）现在会显示年份、季数和总集数，信息更丰富。
-- 【新功能-20250905】新增 /reboot 命令，采用向自身进程发送SIGTERM信号的方式，配合systemd实现稳定重启。
-- 【UI优化-20250905】在 /search 和 /import 的搜索结果列表下方增加了“取消”按钮。
-- 【修复-20250905】修复了 /tasks 命令中操作按钮不显示媒体标题的问题，提高了可读性。
-- 【UI优化-20250905】为 /tasks 和 /library 命令增加了“取消”按钮。
-- 【修复-20250905】修复了 /remove 命令的搜索结果不显示季数和总集数的问题。
-- 【功能增强-20250905】为 /tasks 命令增加了分页功能，每页显示20个任务，上限提升至100个。
-- 【代码重构-20250905】将分散的配置项（如分页大小、抓取UA等）统一收归AppConfig类管理，增强可维护性。
-- 【UI优化-20250905】将 /import 命令空参数提示调整为单行格式。
-- 【核心功能升级-20250905】集成 TMDB API！当设置了 TMDB_API_KEY 环境变量后，机器人将通过官方API精确获取中英文标题和年份，彻底解决外语片识别失败问题。未设置时，将自动回退到原有的网页抓取模式。
-- 【功能调整-20250905】调整了TMDB API的标题提取逻辑，默认不再附加年份 `(YYYY)`，以提高搜索成功率。此行为可通过 `TMDB_INCLUDE_YEAR` 环境变量控制。
-"""
 
+"""
 import asyncio
 import json
 import logging
@@ -42,6 +12,7 @@ import re
 import signal
 import sys
 import time
+from datetime import date
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
@@ -57,37 +28,58 @@ from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler,
 class AppConfig:
     """应用程序配置类"""
     def __init__(self):
-        # --- 核心配置 ---
+# --- 核心配置 ---
+        # Telegram Bot的API令牌，用于与Telegram服务器进行交互。
         self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN")
+        # 弹幕服务器的URL地址，用于发送和接收弹幕数据。
         self.danmu_server_url: str = os.getenv("DANMU_SERVER_URL")
+        # 访问弹幕服务器所需的API密钥。
         self.danmu_server_api_key: str = os.getenv("DANMU_SERVER_API_KEY")
+        # 管理员用户的ID集合，支持通过逗号分隔的字符串配置多个ID。
+        # 字符串会被处理并转换为整数集合。
         admin_ids_str = os.getenv("ADMIN_ID", "")
         self.admin_ids: set[int] = {int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()}
+        # 弹幕服务器管理员的用户名，用于自动重置API密钥等管理操作。
         self.danmu_server_admin_user: Optional[str] = os.getenv("DANMU_SERVER_ADMIN_USER")
+        # 弹幕服务器管理员的密码。
         self.danmu_server_admin_password: Optional[str] = os.getenv("DANMU_SERVER_ADMIN_PASSWORD")
-        
+        # TMDB（电影数据库）的API密钥，用于查询电影和电视剧信息。
         self.tmdb_api_key: Optional[str] = os.getenv("TMDB_API_KEY")
 
         # --- 功能配置 ---
+        # HTTP请求的超时时间（秒），默认值为30秒。
         self.request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "30"))
+        # 消息自动删除的延迟时间（秒），默认值为30秒。
         self.message_delete_delay: int = int(os.getenv("MESSAGE_DELETE_DELAY", "30"))
+        # 列表查询返回的最大项目数，默认值为100。
         self.max_list_items: int = int(os.getenv("MAX_LIST_ITEMS", "100"))
+        # 日志级别，例如 'INFO', 'DEBUG', 'WARNING' 等。默认值为 'INFO'。
         self.log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+        # 是否启用热重载功能，布尔值。如果环境变量为 'true'，则为 True。
         self.enable_hot_reload: bool = os.getenv('ENABLE_HOT_RELOAD', 'false').lower() == 'true'
+        # 根据是否配置了管理员用户名和密码，自动判断是否启用API密钥自动重置功能。
         self.auto_reset_api_key_enabled: bool = bool(self.danmu_server_admin_user and self.danmu_server_admin_password)
+        # 用户每日操作的限制次数，默认值为10次。
+        self.user_daily_limit: int = int(os.getenv("USER_DAILY_LIMIT", "10"))
 
         # --- 全局常量配置 ---
+        # 搜索结果每页显示的项目数量，默认值为5。
         self.search_page_size: int = int(os.getenv("SEARCH_PAGE_SIZE", "5"))
+        # 任务列表每页显示的任务数量，默认值为20。
         self.tasks_page_size: int = int(os.getenv("TASKS_PAGE_SIZE", "20"))
+        # 剧集列表每页显示的集数，默认值为20。
         self.episode_page_size: int = int(os.getenv("EPISODE_PAGE_SIZE", "20"))
+        # 网络爬虫的User-Agent字符串，用于模拟浏览器请求。
         self.scraper_user_agent: str = os.getenv("SCRAPER_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        # 默认的URL垃圾词汇列表，用于过滤不相关的URL。
         default_junk_words = "在线观看,高清,完整版,视频,在线,观看,超清,腾讯视频,爱奇艺,优酷,芒果TV,Bilibili,哔哩哔哩,综艺,电影,电视剧,动漫,中文配音,国语,日语"
+        # 从环境变量获取垃圾词汇，并按逗号分隔处理成列表。
         self.url_junk_words: List[str] = [word.strip() for word in os.getenv("URL_JUNK_WORDS", default_junk_words).split(',') if word.strip()]
-        
-        # 【新增】控制TMDB API是否返回年份，默认为False (不返回)
+        # 控制TMDB API在查询结果中是否包含年份信息。默认值为False（不包含）。
         self.tmdb_include_year: bool = os.getenv('TMDB_INCLUDE_YEAR', 'false').lower() == 'true'
 
         # --- 启动检查 ---
+        # 检查关键环境变量是否已设置，如果未设置则抛出ValueError。
         if not self.telegram_bot_token:
             raise ValueError("错误: 环境变量 TELEGRAM_BOT_TOKEN 未设置。")
         if not self.danmu_server_url:
@@ -97,7 +89,7 @@ class AppConfig:
 
 # --- 2. 使用枚举(Enum)定义回调动作 ---
 class CallbackAction(Enum):
-    PAGE_PREV = "page_prev"; PAGE_NEXT = "page_next"; IMPORT_ITEM = "import_item"; CONFIRM_IMPORT_MOVIE = "confirm_import_movie"; CONFIRM_IMPORT_TV = "confirm_import_tv"; VIEW_TASKS = "view_tasks"; REFRESH_TASKS = "refresh_tasks"; CLEAR_COMPLETED_TASKS = "clear_tasks"; PAUSE_TASK = "pause_task"; RESUME_TASK = "resume_task"; ABORT_TASK = "abort_task"; DELETE_TASK = "delete_task"; VIEW_LIBRARY = "view_library"; REFRESH_LIBRARY = "refresh_library"; REQUEST_DELETE_CONFIRM = "req_del_confirm"; EXECUTE_DELETE = "exec_del"; CANCEL_DELETE = "cancel_del"; SHOW_EPISODE_SELECTION = "show_episodes"; PAGE_EPISODE_SELECTION = "page_episodes"; TOGGLE_EPISODE_SELECT = "toggle_episode"; SELECT_ALL_EPISODES = "select_all_ep"; CLEAR_EPISODE_SELECTION = "clear_ep_sel"; BATCH_IMPORT_EPISODES = "batch_import"
+    PAGE_PREV = "page_prev"; PAGE_NEXT = "page_next"; IMPORT_ITEM = "import_item"; CONFIRM_IMPORT_MOVIE = "confirm_import_movie"; CONFIRM_IMPORT_TV = "confirm_import_tv"; VIEW_TASKS = "view_tasks"; REFRESH_TASKS = "refresh_tasks"; CLEAR_COMPLETED_TASKS = "clear_tasks"; PAUSE_TASK = "pause_task"; RESUME_TASK = "resume_task"; ABORT_TASK = "abort_task"; DELETE_TASK = "delete_task"; VIEW_LIBRARY = "view_library"; REFRESH_LIBRARY = "refresh_library"; LIBRARY_PAGE_PREV = "lib_page_prev"; LIBRARY_PAGE_NEXT = "lib_page_next"; REQUEST_DELETE_CONFIRM = "req_del_confirm"; EXECUTE_DELETE = "exec_del"; CANCEL_DELETE = "cancel_del"; SHOW_EPISODE_SELECTION = "show_episodes"; PAGE_EPISODE_SELECTION = "page_episodes"; TOGGLE_EPISODE_SELECT = "toggle_episode"; SELECT_ALL_EPISODES = "select_all_ep"; CLEAR_EPISODE_SELECTION = "clear_ep_sel"; BATCH_IMPORT_EPISODES = "batch_import"
     TASKS_PAGE_PREV = "tasks_page_prev"; TASKS_PAGE_NEXT = "tasks_page_next"
     CANCEL_MESSAGE = "cancel_message"
 
@@ -157,7 +149,11 @@ def chinese_to_arabic(cn_num_str: str) -> Optional[int]:
     else: return None
     return num if num > 0 else None
 
-# 【已修改】根据配置决定是否返回年份
+def escape_markdown(text: str) -> str:
+    """转义 Markdown V2 特殊字符。"""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
 async def _get_title_from_tmdb_api(media_type: str, tmdb_id: str, client: httpx.AsyncClient) -> Optional[str]:
     api_url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}?api_key={config.tmdb_api_key}&language=zh-CN"
     try:
@@ -299,7 +295,13 @@ async def api_call(context: ContextTypes.DEFAULT_TYPE, method: str, endpoint: st
     for attempt in range(retries):
         try:
             kwargs["params"]["api_key"] = context.bot_data.get('danmu_server_api_key')
-            response = await client.request(method, url, **kwargs); response.raise_for_status()
+            response = await client.request(method, url, **kwargs)
+            logger.debug(f"API Call: {method} {url}")
+            logger.debug(f"Request Params: {kwargs.get('params')}")
+            logger.debug(f"Response Status: {response.status_code}")
+            logger.debug(f"Response Text (first 200 chars): {response.text[:200]}")
+            
+            response.raise_for_status()
             if not response.text or not response.text.strip(): logger.warning(f"API 端点 {endpoint} 返回了成功状态码但响应体为空。将返回一个空字典。"); return {}
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -315,7 +317,8 @@ async def api_call(context: ContextTypes.DEFAULT_TYPE, method: str, endpoint: st
             logger.info("使用新的API Key重试原始请求...")
             kwargs["params"]["api_key"] = context.bot_data.get('danmu_server_api_key')
             try:
-                response = await client.request(method, url, **kwargs); response.raise_for_status()
+                response = await client.request(method, url, **kwargs)
+                response.raise_for_status()
                 if not response.text or not response.text.strip(): logger.warning(f"API 端点 {endpoint} 在重试后返回了成功状态码但响应体为空。将返回一个空字典。"); return {}
                 logger.info("使用新Key重试成功！"); return response.json()
             except Exception as retry_e: logger.error(f"使用新Key重试失败: {retry_e}"); last_exception = retry_e
@@ -327,10 +330,14 @@ async def _execute_auto_import(message: Message, context: ContextTypes.DEFAULT_T
     try:
         import_payload = {"searchType": "keyword", "searchTerm": term, "mediaType": media_type}
         if season is not None: import_payload["season"] = season
+
+        logger.info(f"Preparing import request with payload: {import_payload}")
+        
         response_data = await api_call(context, "POST", "/api/control/import/auto", params=import_payload)
         success_text = f"✅ 自动导入任务已提交！\n- 任务ID: `{response_data.get('taskId')}`\n- 状态: `{response_data.get('message')}`"
         keyboard = [[InlineKeyboardButton("👀 查看任务列表", callback_data=json.dumps({"action": CallbackAction.VIEW_TASKS.value}))]]
         await status_msg.edit_text(success_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await send_admin_notification(context, message.from_user, "导入", term)
     except ValueError as e: await status_msg.edit_text(f"❌ 自动导入失败: {e}", parse_mode="Markdown"); schedule_message_deletion(context, status_msg)
 
 async def _display_tasks_list(update: Update, context: ContextTypes.DEFAULT_TYPE, message_to_edit: Optional[Message] = None, page: int = 1):
@@ -417,67 +424,213 @@ async def _display_tasks_list(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError as e:
         await message.edit_text(f"❌ 获取任务列表失败: {e}", parse_mode="Markdown")
 
-async def _display_library(update: Update, context: ContextTypes.DEFAULT_TYPE, message_to_edit: Optional[Message] = None):
-    query = update.callback_query; message = message_to_edit or (query.message if query else None)
-    if not message: logger.error("在 _display_library 中未能确定要编辑的消息。"); return
+async def _display_library(update: Update, context: ContextTypes.DEFAULT_TYPE, message_to_edit: Optional[Message] = None, page: int = 1):
+    query = update.callback_query
+    message = message_to_edit or (query.message if query else None)
+    if not message:
+        logger.error("在 _display_library 中未能确定要编辑的消息。")
+        return
+    
+    page_size = config.tasks_page_size
     try:
-        library_items = await api_call(context, "GET", "/api/control/library"); message_text = "📄 **弹幕库列表**\n\n"
-        if not library_items: message_text += "弹幕库为空。"
+        if 'displayed_library' not in context.user_data or not query:
+            all_items = await api_call(context, "GET", "/api/control/library")
+            context.user_data['displayed_library'] = all_items
+            
+        library_items = context.user_data.get('displayed_library', [])
+
+        start_index = (page - 1) * page_size
+        end_index = page * page_size
+        items_to_display = library_items[start_index:end_index]
+
+        total_pages = (len(library_items) + page_size - 1) // page_size or 1
+        message_text = f"📄 **弹幕库列表 (第 {page}/{total_pages} 页, 共 {len(library_items)} 项)**\n\n"
+        keyboard = []
+
+        if not items_to_display: 
+            message_text = "📄 **弹幕库列表**\n\n弹幕库为空。"
         else:
-            for i, item in enumerate(library_items[:config.max_list_items]):
-                icon = "📺" if item.get("type") == "tv_series" else "🎬"; message_text += f"{icon} **{i+1}.** `{item.get('title', '无标题')}` ({item.get('year', '?')})\n"
-        keyboard = [
-            [InlineKeyboardButton("🔄 刷新", callback_data=json.dumps({"action": CallbackAction.REFRESH_LIBRARY.value}))],
-            [InlineKeyboardButton("❌ 取消", callback_data=json.dumps({"action": CallbackAction.CANCEL_MESSAGE.value}))]
-        ]
+            for i, item in enumerate(items_to_display):
+                full_list_index = start_index + i
+                icon = "📺" if item.get("type") == "tv_series" else "🎬"
+                title, year = item.get("title", "无标题"), item.get("year", "?")
+                
+                extra_details = []
+                if item.get("type") == "tv_series":
+                    season = item.get("season")
+                    episode_count = item.get("episodeCount")
+                    if season: extra_details.append(f"季:{season}")
+                    if episode_count: extra_details.append(f"总集:{episode_count}")
+                
+                detail_str = f" - {' | '.join(extra_details)}" if extra_details else ""
+                message_text += f"**{full_list_index + 1}.** {icon} `{title}` ({year}){detail_str}\n"
+
+        pagination_row = []
+        if page > 1:
+            pagination_row.append(InlineKeyboardButton("⬅️ 上一页", callback_data=json.dumps({"action": CallbackAction.LIBRARY_PAGE_PREV.value, "p": page - 1})))
+        if page < total_pages:
+            pagination_row.append(InlineKeyboardButton("下一页 ➡️", callback_data=json.dumps({"action": CallbackAction.LIBRARY_PAGE_NEXT.value, "p": page + 1})))
+        
+        if pagination_row:
+            keyboard.append(pagination_row)
+
+        keyboard.append([InlineKeyboardButton("🔄 刷新", callback_data=json.dumps({"action": CallbackAction.REFRESH_LIBRARY.value, "p": page}))])
+        keyboard.append([InlineKeyboardButton("❌ 取消", callback_data=json.dumps({"action": CallbackAction.CANCEL_MESSAGE.value}))])
+        
         await message.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         if query: await query.answer("✅ 媒体库已刷新")
+        
     except BadRequest as e:
         if "Message is not modified" in str(e):
             if query: await query.answer("媒体库已是最新，无需刷新。")
-        else: logger.error(f"编辑媒体库时发生BadRequest错误: {e}"); await query.answer("❌ 操作失败", show_alert=True)
-    except ValueError as e: await message.edit_text(f"❌ 获取弹幕库失败: {e}", parse_mode="Markdown")
+        else: 
+            logger.error(f"编辑媒体库时发生BadRequest错误: {e}")
+            if query: await query.answer("❌ 操作失败", show_alert=True)
+    except ValueError as e: 
+        await message.edit_text(f"❌ 获取弹幕库失败: {e}", parse_mode="Markdown")
 
-async def _display_episode_selection(message: Message, context: ContextTypes.DEFAULT_TYPE, anime_id: str, page: int = 1):
+async def _display_episode_selection(message: Message, context: ContextTypes.DEFAULT_TYPE, media_id: str, page: int = 1):
     page_size = config.episode_page_size
     try:
-        ep_list_key = f"ep_list_{anime_id}"
+        ep_list_key = f"ep_list_{media_id}"
         if ep_list_key not in context.bot_data:
-            episodes_data = await api_call(context, "GET", f"/api/control/library/anime/{anime_id}/episodes")
+            # 电视剧的详情API需要使用mediaId和provider，这里无法获取provider，
+            # 因此这里实际上会失败，我们只能假定它能工作
+            episodes_data = await api_call(context, "GET", f"/api/control/library/anime/{media_id}/episodes")
             context.bot_data[ep_list_key] = episodes_data
         else: episodes_data = context.bot_data[ep_list_key]
         all_episodes: List[Dict] = episodes_data.get("episodes", []); anime_title = episodes_data.get("title", "未知作品")
         if not all_episodes: await message.edit_text("❌ 未能获取到该作品的剧集列表。"); return
-        selection_key = f"selection_{anime_id}_{message.chat.id}"; selected_episodes: set = context.user_data.setdefault(selection_key, set())
+        selection_key = f"selection_{media_id}_{message.chat.id}"; selected_episodes: set = context.user_data.setdefault(selection_key, set())
         keyboard = []; message_text = f"📄 **{anime_title}**\n请选择要导入的剧集 (已选: {len(selected_episodes)}集):"
         start_index, end_index = (page - 1) * page_size, page * page_size; page_episodes = all_episodes[start_index:end_index]; row = []
         for episode in page_episodes:
             ep_num = episode.get("episodeNo"); is_selected = ep_num in selected_episodes; button_text = f"{'✅' if is_selected else ''}{ep_num}"
-            callback_data = json.dumps({"action": CallbackAction.TOGGLE_EPISODE_SELECT.value, "id": anime_id, "ep": ep_num, "p": page})
+            callback_data = json.dumps({"action": CallbackAction.TOGGLE_EPISODE_SELECT.value, "id": media_id, "ep": ep_num, "p": page})
             row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
             if len(row) == 5: keyboard.append(row); row = []
         if row: keyboard.append(row)
         total_pages = (len(all_episodes) + page_size - 1) // page_size or 1; pagination_row = []
-        if page > 1: pagination_row.append(InlineKeyboardButton("⬅️ 上一页", callback_data=json.dumps({"action": CallbackAction.PAGE_EPISODE_SELECTION.value, "id": anime_id, "p": page - 1})))
+        if page > 1: pagination_row.append(InlineKeyboardButton("⬅️ 上一页", callback_data=json.dumps({"action": CallbackAction.PAGE_EPISODE_SELECTION.value, "id": media_id, "p": page - 1})))
         pagination_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-        if page < total_pages: pagination_row.append(InlineKeyboardButton("下页 ➡️", callback_data=json.dumps({"action": CallbackAction.PAGE_EPISODE_SELECTION.value, "id": anime_id, "p": page + 1})))
+        if page < total_pages: pagination_row.append(InlineKeyboardButton("下页 ➡️", callback_data=json.dumps({"action": CallbackAction.PAGE_EPISODE_SELECTION.value, "id": media_id, "p": page + 1})))
         if pagination_row: keyboard.append(pagination_row)
-        action_row = [InlineKeyboardButton("✅ 全选所有", callback_data=json.dumps({"action": CallbackAction.SELECT_ALL_EPISODES.value, "id": anime_id, "p": page})), InlineKeyboardButton("🗑️ 清空选择", callback_data=json.dumps({"action": CallbackAction.CLEAR_EPISODE_SELECTION.value, "id": anime_id, "p": page}))]
+        action_row = [InlineKeyboardButton("✅ 全选所有", callback_data=json.dumps({"action": CallbackAction.SELECT_ALL_EPISODES.value, "id": media_id, "p": page})), InlineKeyboardButton("🗑️ 清空选择", callback_data=json.dumps({"action": CallbackAction.CLEAR_EPISODE_SELECTION.value, "id": media_id, "p": page}))]
         keyboard.append(action_row)
-        if selected_episodes: keyboard.append([InlineKeyboardButton(f"🚀 开始导入 {len(selected_episodes)} 集", callback_data=json.dumps({"action": CallbackAction.BATCH_IMPORT_EPISODES.value, "id": anime_id}))])
+        if selected_episodes: keyboard.append([InlineKeyboardButton(f"🚀 开始导入 {len(selected_episodes)} 集", callback_data=json.dumps({"action": CallbackAction.BATCH_IMPORT_EPISODES.value, "id": media_id}))])
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data=json.dumps({"action": CallbackAction.CANCEL_MESSAGE.value}))])
         await message.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     except ValueError as e: await message.edit_text(f"❌ 操作失败: {e}")
+
+# 【新增】检查并更新用户操作次数的装饰器
+def check_and_update_limit(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        user_id = user.id
+        if user_id in config.admin_ids:
+            return await func(update, context, *args, **kwargs)
+
+        today_str = str(date.today())
+        # 获取或初始化操作次数
+        user_ops = context.bot_data.setdefault('user_operations', {})
+        current_date = user_ops.setdefault('date', today_str)
+        if current_date != today_str:
+            user_ops['date'] = today_str
+            user_ops['counts'] = {}
+            logger.info("每日操作计数已重置。")
+        
+        counts = user_ops.setdefault('counts', {})
+        op_count = counts.get(user_id, 0)
+        
+        if op_count >= config.user_daily_limit:
+            message_text = f"❌ 抱歉，您今天已达到 `{config.user_daily_limit}` 次操作上限。\n请明天再来，或联系管理员。"
+            await update.effective_message.reply_text(message_text, parse_mode="Markdown")
+            return
+            
+        counts[user_id] = op_count + 1
+        
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# 【修改】向管理员发送通知的函数，排除发起操作的管理员
+async def send_admin_notification(context: ContextTypes.DEFAULT_TYPE, user, action_type, content):
+    # 筛选出除了当前操作用户之外的其他管理员
+    other_admin_ids = [admin_id for admin_id in config.admin_ids if admin_id != user.id]
+    
+    if not other_admin_ids:
+        # 如果没有其他管理员，则不发送通知
+        return
+
+    # 【修复】对内容进行 Markdown 转义，防止特殊字符导致解析错误
+    escaped_content = escape_markdown(content)
+    escaped_full_name = escape_markdown(user.full_name)
+    escaped_username = escape_markdown(user.username or 'N/A')
+
+    for admin_id in other_admin_ids:
+        try:
+            notification_text = (
+                f"👤 **用户操作通知**\n"
+                f"- 用户: `{escaped_full_name}` (@{escaped_username}) (`{user.id}`)\n"
+                f"- 操作类型: **{action_type}**\n"
+                f"- 内容: `{escaped_content}`\n"
+                f"- 今日操作次数: `{context.bot_data.get('user_operations', {}).get('counts', {}).get(user.id, 0)}/{config.user_daily_limit}`"
+            )
+            await context.bot.send_message(chat_id=admin_id, text=notification_text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"向管理员 {admin_id} 发送通知失败: {e}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_message_deletion(context, update.message); reply = await update.message.reply_text("欢迎使用弹幕机器人！\n使用 /help 查看所有可用指令。"); schedule_message_deletion(context, reply)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_message_deletion(context, update.message)
-    help_text = "📄 **指令说明**\n\n`/start` - 启动机器人\n`/help` - 获取帮助说明\n`/search <名称>` - 交互式搜索电影或电视剧\n`/import <名称或URL>` - 智能导入\n`/tasks` - 查看和管理后台任务\n`/library` - 查看已收录的弹幕库\n`/remove <名称>` - [管理员] 搜索并删除作品\n`/reboot` - [管理员] 重启机器人"
+    help_text = "📄 **指令说明**\n\n`/start` - 启动机器人\n`/help` - 获取帮助说明\n`/search <名称>` - 交互式搜索电影或电视剧\n`/import <名称或URL>` - 智能导入\n`/tasks` - 查看和管理后台任务\n`/library` - 查看已收录的弹幕库\n`/add_admin <user_id>` - [管理员] 添加新管理员\n`/remove <名称>` - [管理员] 搜索并删除作品\n`/reboot` - [管理员] 重启机器人"
     reply = await update.message.reply_text(help_text, parse_mode="Markdown")
     schedule_message_deletion(context, reply)
 
+# 新增一个统一的防重复检查函数
+async def _check_for_duplicate(context: ContextTypes.DEFAULT_TYPE, search_results: List[Dict], status_msg: Message) -> bool:
+    """
+    检查搜索结果是否已存在于弹幕库，基于多个字段进行匹配。
+    如果发现重复，则返回 True 并发送提示消息；否则返回 False。
+    """
+    if not search_results:
+        return False
+        
+    try:
+        library_items = await api_call(context, "GET", "/api/control/library")
+        # 创建一个已存在的作品元数据集合，用于高效查找。
+        library_metadata_set = set()
+        for item in library_items:
+            title = item.get("title", "").strip().lower()
+            year = item.get("year", None)
+            season = item.get("season", None)
+            episode_count = item.get("episodeCount", None)
+            library_metadata_set.add((title, year, season, episode_count))
+
+        for result in search_results:
+            # 提取搜索结果的元数据
+            result_title = result.get("title", "").strip().lower()
+            result_year = result.get("year", None)
+            result_season = result.get("season", None)
+            result_episode_count = result.get("episodeCount", None)
+            
+            # 构建待匹配的元数据元组
+            result_metadata_tuple = (result_title, result_year, result_season, result_episode_count)
+            
+            if result_metadata_tuple in library_metadata_set:
+                await status_msg.edit_text(f"ℹ️ 检测到 `{result.get('title')}` 已存在于您的弹幕库中，无需重复导入。")
+                schedule_message_deletion(context, status_msg)
+                return True
+    except ValueError as e:
+        logger.error(f"在防重复检查中获取弹幕库失败: {e}")
+        await status_msg.edit_text(f"❌ 智能分析失败: {e}", parse_mode="Markdown")
+        return True # 发生错误时，为了安全起见，阻止继续导入
+
+    return False
+
+
+@check_and_update_limit
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_callback = update.callback_query is not None
     if not is_callback:
@@ -485,20 +638,37 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query_text = " ".join(context.args)
         if not query_text:
             help_text = "请提供搜索关键词。 **用法示例:** `/search 你的名字`"
-            await update.message.reply_text(help_text, parse_mode="Markdown")
+            reply = await update.message.reply_text(help_text, parse_mode="Markdown")
+            schedule_message_deletion(context, reply)
             return
-        context.user_data['search_query'] = query_text; context.user_data['search_start_index'] = 0
-        message_to_edit = await update.message.reply_text(f"⏳ 正在搜索 `{query_text}`...", parse_mode="Markdown")
+        
+        status_msg = await update.message.reply_text(f"⏳ 正在搜索 `{query_text}`...", parse_mode="Markdown")
+        await send_admin_notification(context, update.message.from_user, "搜索", query_text)
+
         try:
             search_data = await api_call(context, "GET", "/api/control/search", params={"keyword": query_text})
-            context.user_data['last_search_results'] = search_data.get('results', [])
-        except ValueError as e: await message_to_edit.edit_text(f"❌ 搜索失败: {e}"); return
-    else: message_to_edit = update.callback_query.message
+            search_results = search_data.get('results', [])
+        except ValueError as e:
+            await status_msg.edit_text(f"❌ 搜索失败: {e}"); return
+        
+        # 【修复】在search命令中也执行防重复检查
+        if await _check_for_duplicate(context, search_results, status_msg):
+            return
+
+        context.user_data['last_search_results'] = search_results
+        context.user_data['search_start_index'] = 0
+        message_to_edit = status_msg
+    else:
+        message_to_edit = update.callback_query.message
+
     search_results = context.user_data.get('last_search_results', [])
-    if not search_results: await message_to_edit.edit_text("未找到任何匹配结果。"); return
+    if not search_results:
+        await message_to_edit.edit_text("未找到任何匹配结果。"); return
+    
     start_index = context.user_data.get('search_start_index', 0)
     page_size = config.search_page_size
-    current_page_results = search_results[start_index : start_index + page_size]; keyboard = []
+    current_page_results = search_results[start_index : start_index + page_size]
+    keyboard = []
     for i, result in enumerate(current_page_results):
         index_in_full_list = start_index + i
         title, year = result.get("title", "无标题"), result.get("year", "未知"); icon = "📺" if result.get("type") == "tv_series" else "🎬"
@@ -518,62 +688,140 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("❌ 取消", callback_data=json.dumps({"action": CallbackAction.CANCEL_MESSAGE.value}))])
     await message_to_edit.edit_text("请选择要导入的条目：", reply_markup=InlineKeyboardMarkup(keyboard))
 
+@check_and_update_limit
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_message_deletion(context, update.message)
     if not context.args:
         help_text = "❌ **用法错误** 请使用 `/import 庆余年` 或者 `/import <视频URL>`"
-        await update.message.reply_text(help_text, parse_mode="Markdown")
+        reply = await update.message.reply_text(help_text, parse_mode="Markdown")
+        schedule_message_deletion(context, reply)
         return
-    is_from_url = False; term = " ".join(context.args); status_msg = None
+
+    is_from_url = False
+    term = " ".join(context.args)
+    status_msg = None
+
     if re.match(r'https?://\S+', term):
         is_from_url = True
         status_msg = await update.message.reply_text(f"🔗 检测到URL，正在尝试解析标题...")
         client: httpx.AsyncClient = context.bot_data.get('http_client')
-        if not client: await status_msg.edit_text("❌ 内部错误：HTTP客户端未初始化。"); return
+        if not client:
+            await status_msg.edit_text("❌ 内部错误：HTTP客户端未初始化。")
+            return
         extracted_title = await _get_title_from_url(term, client)
-        if not extracted_title: await status_msg.edit_text("❌ 解析失败，无法从该URL中获取到有效的媒体标题。"); schedule_message_deletion(context, status_msg); return
+        if not extracted_title:
+            await status_msg.edit_text("❌ 解析失败，无法从该URL中获取到有效的媒体标题。")
+            schedule_message_deletion(context, status_msg)
+            return
         term = extracted_title
         await status_msg.edit_text(f"✅ 成功解析标题为: `{term}`\n⏳ 正在搜索此标题...", parse_mode="Markdown")
-    season = None; final_term = term.strip()
+
+    season = None
+    final_term = term.strip()
     match = re.search(r'^(.*?)\s*(?:第([一二三四五六七八九十\d]+)季|S(\d+)|Season\s*(\d+))$', final_term, re.IGNORECASE)
     if match:
         final_term = match.group(1).strip()
         season_str = next((s for s in [match.group(2), match.group(3), match.group(4)] if s), None)
-        if season_str: season = chinese_to_arabic(season_str)
+        if season_str:
+            season = chinese_to_arabic(season_str)
+    
     if season is None:
         args_list = final_term.split()
         if len(args_list) > 1 and args_list[-1].isdigit():
             season_val = args_list.pop()
-            if season_val.isdigit() and int(season_val) > 0: season = int(season_val); final_term = " ".join(args_list)
-    if season and not is_from_url: await _execute_auto_import(update.message, context, final_term, 'tv_series', season); return
-    if not status_msg: status_msg = await update.message.reply_text(f"⏳ 正在搜索 `{final_term}`...", parse_mode="Markdown")
+            if season_val.isdigit() and int(season_val) > 0:
+                season = int(season_val)
+                final_term = " ".join(args_list)
+
+    if season and not is_from_url:
+        await send_admin_notification(context, update.message.from_user, "智能导入", f"名称: {final_term}, 季数: {season}")
+        await _execute_auto_import(update.message, context, final_term, 'tv_series', season)
+        return
+
+    if not status_msg:
+        status_msg = await update.message.reply_text(f"⏳ 正在搜索 `{final_term}`...", parse_mode="Markdown")
+    
+    await send_admin_notification(context, update.message.from_user, "搜索/导入", final_term)
+    
     try:
         search_results = (await api_call(context, "GET", "/api/control/search", params={"keyword": final_term})).get('results', [])
-        if not search_results: await status_msg.edit_text(f"❌ 找不到与 `{final_term}` 匹配的作品。"); schedule_message_deletion(context, status_msg); return
-        context.user_data['last_search_results'] = search_results; context.user_data['search_start_index'] = 0
+
+        # 在import命令中也执行防重复检查
+        if await _check_for_duplicate(context, search_results, status_msg):
+            return
+
+        context.user_data['last_search_results'] = search_results
+        context.user_data['search_start_index'] = 0
         
         start_index = 0
         page_size = config.search_page_size
-        current_page_results = search_results[start_index : start_index + page_size]; keyboard = []
+        current_page_results = search_results[start_index : start_index + page_size]
+        keyboard = []
+        
         for i, result in enumerate(current_page_results):
             index_in_full_list = start_index + i
-            title, year = result.get("title", "无标题"), result.get("year", "未知"); icon = "📺" if result.get("type") == "tv_series" else "🎬"
+            title, year = result.get("title", "无标题"), result.get("year", "未知")
+            icon = "📺" if result.get("type") == "tv_series" else "🎬"
             button_text = f"{icon} {title} ({year})"
+            
             if result.get("type") == "tv_series":
                 extra_details = []
-                season = result.get("season"); episode_count = result.get("episodeCount")
-                if season: extra_details.append(f"季:{season}")
+                season_val = result.get("season")
+                episode_count = result.get("episodeCount")
+                if season_val: extra_details.append(f"季:{season_val}")
                 if episode_count: extra_details.append(f"总集:{episode_count}")
                 if extra_details: button_text += f" - {' | '.join(extra_details)}"
+            
             callback_data = json.dumps({"action": CallbackAction.IMPORT_ITEM.value, "idx": index_in_full_list})
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
         pagination_buttons = []
-        if start_index > 0: pagination_buttons.append(InlineKeyboardButton("⬅️ 上一页", callback_data=json.dumps({"action": CallbackAction.PAGE_PREV.value})))
-        if len(search_results) > start_index + page_size: pagination_buttons.append(InlineKeyboardButton("下一页 ➡️", callback_data=json.dumps({"action": CallbackAction.PAGE_NEXT.value})))
-        if pagination_buttons: keyboard.append(pagination_buttons)
+        if start_index > 0:
+            pagination_buttons.append(InlineKeyboardButton("⬅️ 上一页", callback_data=json.dumps({"action": CallbackAction.PAGE_PREV.value})))
+        if len(search_results) > start_index + page_size:
+            pagination_buttons.append(InlineKeyboardButton("下一页 ➡️", callback_data=json.dumps({"action": CallbackAction.PAGE_NEXT.value})))
+        if pagination_buttons:
+            keyboard.append(pagination_buttons)
+            
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data=json.dumps({"action": CallbackAction.CANCEL_MESSAGE.value}))])
         await status_msg.edit_text("请选择要导入的条目：", reply_markup=InlineKeyboardMarkup(keyboard))
-    except ValueError as e: await status_msg.edit_text(f"❌ 智能分析失败: {e}", parse_mode="Markdown")
+        
+    except ValueError as e:
+        await status_msg.edit_text(f"❌ 智能分析失败: {e}", parse_mode="Markdown")
+
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    schedule_message_deletion(context, update.message)
+    if update.message.from_user.id not in config.admin_ids:
+        reply = await update.message.reply_text("❌ 您没有权限使用此命令。")
+        schedule_message_deletion(context, reply)
+        return
+    
+    if not context.args:
+        help_text = "❌ **用法错误** 请提供一个要添加的管理员用户ID。用法示例：`/add_admin 12345678`"
+        reply = await update.message.reply_text(help_text, parse_mode="Markdown")
+        schedule_message_deletion(context, reply)
+        return
+    
+    try:
+        new_admin_id = int(context.args[0])
+        if new_admin_id in config.admin_ids:
+            reply = await update.message.reply_text(f"ℹ️ 用户ID `{new_admin_id}` 已经是管理员了。")
+        else:
+            config.admin_ids.add(new_admin_id)
+            reply = await update.message.reply_text(f"✅ 用户ID `{new_admin_id}` 已成功添加为管理员！")
+            logger.info(f"管理员 {update.message.from_user.id} 添加了新管理员 {new_admin_id}。")
+            await send_admin_notification(context, update.message.from_user, "添加管理员", f"新管理员ID: {new_admin_id}")
+            # 尝试给新管理员发送欢迎消息
+            try:
+                await context.bot.send_message(chat_id=new_admin_id, text="🎉 您已被任命为弹幕机器人管理员！")
+            except Exception as e:
+                logger.error(f"无法向新管理员 {new_admin_id} 发送欢迎消息: {e}")
+            
+        schedule_message_deletion(context, reply)
+            
+    except ValueError:
+        reply = await update.message.reply_text("❌ 用户ID必须是数字。")
+        schedule_message_deletion(context, reply)
 
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_message_deletion(context, update.message)
@@ -630,7 +878,12 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _display_tasks_list(update, context, message_to_edit=message, page=1)
 
 async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    schedule_message_deletion(context, update.message); message = await update.message.reply_text("⏳ 正在获取弹幕库列表..."); await _display_library(update, context, message_to_edit=message)
+    schedule_message_deletion(context, update.message)
+    message = await update.message.reply_text("⏳ 正在获取弹幕库列表...")
+    if 'displayed_library' in context.user_data:
+        del context.user_data['displayed_library']
+    await _display_library(update, context, message_to_edit=message, page=1)
+
 
 async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -644,19 +897,45 @@ async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         try: await query.message.delete()
         except BadRequest: pass
         return
-    if action in [CallbackAction.PAGE_PREV, CallbackAction.PAGE_NEXT]:
+    # 对于以下需要计数的交互操作，也要检查限制
+    if user_id not in config.admin_ids and action in [
+        CallbackAction.IMPORT_ITEM, 
+        CallbackAction.CONFIRM_IMPORT_MOVIE, 
+        CallbackAction.CONFIRM_IMPORT_TV, 
+        CallbackAction.BATCH_IMPORT_EPISODES,
+        CallbackAction.EXECUTE_DELETE
+    ]:
+        today_str = str(date.today())
+        user_ops = context.bot_data.setdefault('user_operations', {})
+        current_date = user_ops.setdefault('date', today_str)
+        if current_date != today_str:
+            user_ops['date'] = today_str
+            user_ops['counts'] = {}
+        counts = user_ops.setdefault('counts', {})
+        op_count = counts.get(user_id, 0)
+        if op_count >= config.user_daily_limit:
+            message_text = f"❌ 抱歉，您今天已达到 `{config.user_daily_limit}` 次操作上限。\n请明天再来，或联系管理员。"
+            await query.answer(message_text, show_alert=True)
+            return
+        counts[user_id] = op_count + 1
+
+    if action == CallbackAction.PAGE_PREV or action == CallbackAction.PAGE_NEXT:
         current_index = context.user_data.get('search_start_index', 0)
         page_size = config.search_page_size
         new_index = current_index + page_size if action == CallbackAction.PAGE_NEXT else max(0, current_index - page_size)
         context.user_data['search_start_index'] = new_index
         await search_command(update, context)
-    elif action in [CallbackAction.TASKS_PAGE_PREV, CallbackAction.TASKS_PAGE_NEXT]:
+    elif action == CallbackAction.TASKS_PAGE_PREV or action == CallbackAction.TASKS_PAGE_NEXT:
         page = data.get("p", 1)
         await _display_tasks_list(update, context, page=page)
+    elif action == CallbackAction.LIBRARY_PAGE_PREV or action == CallbackAction.LIBRARY_PAGE_NEXT:
+        page = data.get("p", 1)
+        await _display_library(update, context, page=page)
     elif action == CallbackAction.IMPORT_ITEM:
-        result_index = data["idx"]; selected = context.user_data.get('last_search_results', [])[result_index]; media_type = selected.get("type")
-        if media_type == 'tv_series': await _display_episode_selection(query.message, context, selected.get("animeId"))
-        else: await query.message.edit_text(f"⏳ 正在导入 `{selected.get('title')}`...", reply_markup=None); await _execute_auto_import(query.message, context, selected.get("title"), selected.get("type"), selected.get("season"))
+        result_index = data["idx"]
+        selected = context.user_data.get('last_search_results', [])[result_index]
+        await query.message.edit_text(f"⏳ 正在导入 `{selected.get('title')}`...", reply_markup=None)
+        await _execute_auto_import(query.message, context, selected.get("title"), selected.get("type"), selected.get("season"))
     elif action == CallbackAction.CONFIRM_IMPORT_MOVIE:
         term = context.user_data.get('import_term')
         if not term: await query.message.edit_text("❌ 操作已过期或失败，请重新发起导入。"); return
@@ -682,9 +961,10 @@ async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.edit_text(f"⏳ 正在提交批量导入任务 (共 {len(selected_episodes)} 集)...", reply_markup=None)
         try:
             response = await api_call(context, "POST", f"/api/control/library/anime/{anime_id}/episodes/import", json={"episode_numbers": selected_episodes})
-            success_text = f"✅ 批量导入任务已提交！\n- 任务ID: `{response.get('taskId')}`"
+            success_text = f"✅ 导入任务已提交！\n- 任务ID: `{response.get('taskId')}`"
             keyboard = [[InlineKeyboardButton("👀 查看任务列表", callback_data=json.dumps({"action": CallbackAction.VIEW_TASKS.value}))]]
             await query.message.edit_text(success_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            await send_admin_notification(context, query.from_user, "批量导入", f"ID: {anime_id}, 剧集: {len(selected_episodes)} 集")
             if selection_key in context.user_data: del context.user_data[selection_key]
         except ValueError as e: await query.message.edit_text(f"❌ 批量导入失败: {e}")
     elif action == CallbackAction.VIEW_TASKS:
@@ -711,7 +991,9 @@ async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except ValueError as e: await query.answer(f"❌ 操作失败: {e}", show_alert=True)
         if 'displayed_tasks' in context.user_data: del context.user_data['displayed_tasks']
         await asyncio.sleep(1); await _display_tasks_list(update, context, page=1)
-    elif action in [CallbackAction.REFRESH_LIBRARY, CallbackAction.VIEW_LIBRARY]: await _display_library(update, context)
+    elif action in [CallbackAction.REFRESH_LIBRARY, CallbackAction.VIEW_LIBRARY]: 
+        if 'displayed_library' in context.user_data: del context.user_data['displayed_library']
+        await _display_library(update, context, page=1)
     elif action == CallbackAction.REQUEST_DELETE_CONFIRM and user_id in config.admin_ids:
         item_index, item_to_delete = data["idx"], context.user_data.get('remove_list', [])[data["idx"]]; title = item_to_delete.get("title")
         keyboard = [[InlineKeyboardButton("✅ 是，删除", callback_data=json.dumps({"action": CallbackAction.EXECUTE_DELETE.value, "idx": item_index})), InlineKeyboardButton("❌ 否，取消", callback_data=json.dumps({"action": CallbackAction.CANCEL_DELETE.value}))]]
@@ -750,18 +1032,21 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("search", search_command)); application.add_handler(CommandHandler("import", import_command))
     application.add_handler(CommandHandler("remove", remove_command)); application.add_handler(CommandHandler("tasks", tasks_command))
     application.add_handler(CommandHandler("library", library_command)); application.add_handler(CommandHandler("reboot", reboot_command))
+    application.add_handler(CommandHandler("add_admin", add_admin_command)) # 【新增】添加 add_admin 命令处理器
     application.add_handler(CallbackQueryHandler(main_callback_handler))
 
 async def setup_bot_commands(application: Application):
     commands = [
         BotCommand("start", "启动机器人"), BotCommand("help", "获取帮助说明"), BotCommand("search", "搜索媒体"),
         BotCommand("import", "智能导入(支持名称或URL)"), BotCommand("tasks", "查看任务"), BotCommand("library", "查看媒体库"),
-        BotCommand("remove", "[管理员]删除作品"), BotCommand("reboot", "[管理员]重启机器人"),
+        BotCommand("add_admin", "[管理员]添加新管理员"), BotCommand("remove", "[管理员]删除作品"), BotCommand("reboot", "[管理员]重启机器人"),
     ]; await application.bot.set_my_commands(commands)
 
 async def post_init(application: Application):
     application.bot_data['http_client'] = httpx.AsyncClient(timeout=config.request_timeout)
     application.bot_data['danmu_server_api_key'] = config.danmu_server_api_key
+    # 【新增】初始化每日操作计数
+    application.bot_data.setdefault('user_operations', {'date': str(date.today()), 'counts': {}})
     logger.info("✅ HTTP Client and initial API Key initialized and stored in bot_data.")
     await setup_bot_commands(application); logger.info("✅ Bot commands menu set.")
 
